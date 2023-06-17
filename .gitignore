@@ -30,3 +30,11 @@
 *.exe
 *.out
 *.app
+
+.vs/
+obj/
+bin/
+Project/x64
+ThirdParty/GLAD/bin-int
+build/
+x64
