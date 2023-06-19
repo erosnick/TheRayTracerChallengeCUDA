@@ -2,5 +2,3 @@
 
 void createCUDAResources();
 void releaseCUDAResources();
-
-void render();

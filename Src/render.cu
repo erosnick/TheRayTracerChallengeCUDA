@@ -20,24 +20,38 @@ dim3 gridSize;
 
 cudaArray* cudaTextureArray = nullptr;
 
-tuple* devImageData = nullptr;
+tuple* deviceImageData = nullptr;
 
 cudaGraphicsResource* cudaTextureResource = nullptr;
 
+curandState* deviceRandState = nullptr;
+
+void cudaAllocateTextureMemory(tuple** deviceImageData, size_t size);
+
+void cudaFreeTextureMemory(tuple* deviceImageData);
+
+void writeToPNG(const std::string& path, int32_t width, int32_t height, const std::vector<uint8_t>& pixelData);
+
+void createCUDAResources();
+
+void releaseCUDAResources();
+
 void updateOpenGLTexture();
 
-__global__ void cudaWriteTexture(tuple* imageData, int width, int height);
+__global__ void renderInit(int width, int height, curandState* rand_state);
+
+__global__ void cudaWriteTexture(tuple* imageData, int width, int height, curandState* randState);
 
 // CUDA function to allocate device memory for the texture
-void cudaAllocateTextureMemory(tuple** devImageData, size_t size)
+void cudaAllocateTextureMemory(tuple** deviceImageData, size_t size)
 {
-    cudaMalloc((void**)devImageData, size);
+    cudaMalloc((void**)deviceImageData, size);
 }
 
 // CUDA function to free device memory for the texture
-void cudaFreeTextureMemory(tuple* devImageData)
+void cudaFreeTextureMemory(tuple* deviceImageData)
 {
-    cudaFree(devImageData);
+    cudaFree(deviceImageData);
 }
 
 void writeToPNG(const std::string& path, int32_t width, int32_t height, const std::vector<uint8_t>& pixelData)
@@ -50,7 +64,7 @@ void writeToPNG(const std::string& path, int32_t width, int32_t height, const st
 void createCUDAResources()
 {
     // Allocate device memory for the texture
-    cudaAllocateTextureMemory(&devImageData, WindowWidth * WindowHeight * sizeof(tuple));
+    cudaAllocateTextureMemory(&deviceImageData, WindowWidth * WindowHeight * sizeof(tuple));
 
     // Set CUDA-OpenGL interop
     checkCudaErrors(cudaGraphicsGLRegisterImage(&cudaTextureResource, texture, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsNone));
@@ -61,6 +75,10 @@ void createCUDAResources()
     blockSize = { 16, 16 };
     gridSize = { (WindowWidth + blockSize.x - 1) / blockSize.x, (WindowHeight + blockSize.y - 1) / blockSize.y };
 
+    checkCudaErrors(cudaMalloc((void**)&deviceRandState, WindowWidth * WindowHeight * sizeof(curandState)));
+
+    renderInit << <gridSize, blockSize >> > (WindowWidth, WindowHeight, deviceRandState);
+
     updateOpenGLTexture();
 
     // Unmap the texture from CUDA resources
@@ -68,7 +86,7 @@ void createCUDAResources()
 
     // Read back the texture data from device to host
     tuple* hostImageData = new tuple[WindowWidth * WindowHeight];
-    checkCudaErrors(cudaMemcpy(hostImageData, devImageData, WindowWidth * WindowHeight * sizeof(tuple), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(hostImageData, deviceImageData, WindowWidth * WindowHeight * sizeof(tuple), cudaMemcpyDeviceToHost));
 
     std::vector<uint8_t> pixelData;
 
@@ -95,40 +113,59 @@ void createCUDAResources()
 void releaseCUDAResources()
 {
     cudaGraphicsUnregisterResource(cudaTextureResource);
-    cudaFreeTextureMemory(devImageData);
+    cudaFreeTextureMemory(deviceImageData);
+
+    cudaFree(deviceRandState);
 }
 
 void updateOpenGLTexture()
 {
-    cudaWriteTexture << <gridSize, blockSize >> > (devImageData, WindowWidth, WindowHeight);
+    cudaWriteTexture << <gridSize, blockSize >> > (deviceImageData, WindowWidth, WindowHeight, deviceRandState);
 
     checkCudaErrors(cudaDeviceSynchronize());
 
     // Copy CUDA texture data to OpenGL texture
-    checkCudaErrors(cudaMemcpy2DToArray(cudaTextureArray, 0, 0, devImageData, WindowWidth * sizeof(tuple),
+    checkCudaErrors(cudaMemcpy2DToArray(cudaTextureArray, 0, 0, deviceImageData, WindowWidth * sizeof(tuple),
         WindowWidth * sizeof(tuple), WindowHeight, cudaMemcpyDeviceToDevice));
 }
 
-// CUDA kernel function for writing data to a texture
-__global__ void cudaWriteTexture(tuple* imageData, int width, int height)
+__global__ void renderInit(int width, int height, curandState* rand_state) 
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    if ((i >= width) || (j >= height)) return;
+    int pixelIndex = j * width + i;
+    // Original: Each thread gets same seed, a different sequence number, no offset
+    // curand_init(1984, pixelIndex, 0, &rand_state[pixelIndex]);
+    // BUGFIX, see Issue#2: Each thread gets different seed, same sequence for
+    // performance improvement of about 2x!
+    curand_init(1984 + pixelIndex, 0, 0, &rand_state[pixelIndex]);
+}
+
+// CUDA kernel function for writing data to a texture
+__global__ void cudaWriteTexture(tuple* imageData, int width, int height, curandState* randState)
+{
+    int32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x < width && y < height) 
     {
-        int index = y * width + x;
+        int32_t pixelIndex = y * width + x;
+
+        curandState localRandState = randState[pixelIndex];
+
+        float r = float(curand_uniform(&localRandState));
+        float g = float(curand_uniform(&localRandState));
+        float b = float(curand_uniform(&localRandState));
+
         tuple color;
-        color.x = float(x) / width;  // Red component
-        color.y = float(y) / height;  // Green component
-        color.z = 0.0f;  // Blue component
+        color.x = r;  // Red component
+        color.y = g;  // Green component
+        color.z = b;  // Blue component
         color.w = 1.0f;  // Alpha component
 
-        imageData[index] = color;
+        imageData[pixelIndex] = color;
+
+        randState[pixelIndex] = localRandState;
     }
-}
-
-void render()
-{
-
 }
